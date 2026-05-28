@@ -63,13 +63,17 @@ Generator::~Generator() {
 }
 
 // =============================================================================
-// generate() — the main inference function
+// generate_stream() — the main inference function, token-by-token callback.
+//
+// All inference logic lives here. generate() is a thin collector wrapper so
+// there is no duplicated setup/teardown code between the two call styles.
 // =============================================================================
 
-std::string Generator::generate(const std::string& system_prompt,
+void Generator::generate_stream(const std::string& system_prompt,
                                   const std::string& user_prompt,
                                   int max_tokens,
-                                  float temperature) {
+                                  float temperature,
+                                  std::function<bool(const char* piece, int plen)> on_token) {
 
     // Only one request can use the context at a time
     std::lock_guard<std::mutex> lock(mtx_);
@@ -105,7 +109,9 @@ std::string Generator::generate(const std::string& system_prompt,
                                           true, tbuf.data(), static_cast<int32_t>(tbuf.size()));
     }
     if (tlen < 0) {
-        return "<!-- generator error: chat template failed -->";
+        constexpr char err[] = "<!-- generator error: chat template failed -->";
+        on_token(err, static_cast<int>(sizeof(err) - 1));
+        return;
     }
     std::string formatted(tbuf.data(), tlen);
 
@@ -142,7 +148,11 @@ std::string Generator::generate(const std::string& system_prompt,
     llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
     if (llama_decode(ctx_, batch) != 0) {
         llama_memory_clear(llama_get_memory(ctx_), true);
-        return "<!-- generator error: prefill decode failed -->";
+        // Propagate the error via the callback so both streaming and non-streaming
+        // callers see something useful rather than a silent empty response.
+        constexpr char err[] = "<!-- generator error: prefill decode failed -->";
+        on_token(err, static_cast<int>(sizeof(err) - 1));
+        return;
     }
 
     // -------------------------------------------------------------------------
@@ -171,9 +181,6 @@ std::string Generator::generate(const std::string& system_prompt,
     // the next input, and repeat until we hit the end-of-sequence token or
     // exhaust our budget. This is the inner loop that takes most of the time.
     // -------------------------------------------------------------------------
-    std::string output;
-    const llama_token eos = llama_vocab_eos(vocab);
-
     for (int i = 0; i < max_tokens; i++) {
         // Sample the next token from the current logits
         llama_token token = llama_sampler_sample(sampler, ctx_, -1);
@@ -187,7 +194,10 @@ std::string Generator::generate(const std::string& system_prompt,
         // lstrip=0 keeps leading spaces (important for word-boundary tokens).
         char piece[256];
         int plen = llama_token_to_piece(vocab, token, piece, sizeof(piece), 0, true);
-        if (plen > 0) output.append(piece, plen);
+
+        // Deliver the token fragment to the caller. A false return means the
+        // caller wants to abort (e.g. the streaming client disconnected).
+        if (plen > 0 && !on_token(piece, plen)) break;
 
         // Feed the new token back into the model for the next forward pass.
         // This single-token batch extends the KV cache by one position.
@@ -200,6 +210,21 @@ std::string Generator::generate(const std::string& system_prompt,
     // Clear the KV cache so the next request starts with a clean slate.
     // Without this, tokens from this conversation would "leak" into the next one.
     llama_memory_clear(llama_get_memory(ctx_), true);
+}
 
+// =============================================================================
+// generate() — blocking wrapper around generate_stream()
+// =============================================================================
+
+std::string Generator::generate(const std::string& system_prompt,
+                                  const std::string& user_prompt,
+                                  int max_tokens,
+                                  float temperature) {
+    std::string output;
+    generate_stream(system_prompt, user_prompt, max_tokens, temperature,
+        [&output](const char* piece, int plen) {
+            output.append(piece, plen);
+            return true;  // never abort — collect everything
+        });
     return output;
 }

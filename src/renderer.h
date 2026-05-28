@@ -23,3 +23,7 @@ std::string render_chat_page(const std::string& msg,
 
 // URL-encodes a string for use in query parameters (spaces become +, etc.)
 std::string url_encode(const std::string& s);
+
+// Checks BODY BGCOLOR vs TEXT contrast; replaces TEXT with black or white if
+// the ratio is below 3:1. Exposed here for use by the streaming page filter.
+std::string fix_color_contrast(const std::string& html);

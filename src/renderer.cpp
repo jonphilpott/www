@@ -205,7 +205,7 @@ static double contrast_ratio(int r1, int g1, int b1, int r2, int g2, int b2) {
     return (l1 + 0.05) / (l2 + 0.05);
 }
 
-static std::string fix_color_contrast(const std::string& html) {
+std::string fix_color_contrast(const std::string& html) {
     // Find the BODY tag and pull out BGCOLOR and TEXT attribute values
     std::regex body_pat(R"(<body([^>]*)>)", std::regex_constants::icase);
     std::smatch bm;

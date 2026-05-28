@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <random>
 #include <mutex>
+#include <cctype>
 
 // =============================================================================
 // Argument parsing
@@ -173,6 +174,175 @@ static std::string chat_user(const std::string& msg) {
 }
 
 // =============================================================================
+// PageStreamFilter — stateful post-processor for the /page streaming path.
+//
+// Sits between generate_stream() and the httplib DataSink. Applies the same
+// logical fixes as render_content_page() but in a streaming-compatible way:
+//
+//   Phase 1 (PreambleHunt): buffer and discard until <html is found, so any
+//     stray "Here is your page:" preamble from the model never reaches the browser.
+//
+//   Phase 2 (BodyHunt): buffer until the BODY opening tag closes (we see its ">"),
+//     then call fix_color_contrast() on the accumulated header and flush it.
+//     The BODY tag is typically in the first 100–200 chars, so the browser only
+//     waits a fraction of a second before content starts arriving.
+//
+//   Phase 3 (Streaming): pass each character through a streaming
+//     highlight_false_facts state machine and write to the sink immediately.
+//
+// fix_code_blocks() is intentionally not applied — it requires buffering complete
+// <PRE>...</PRE> blocks which could span hundreds of tokens. The non-streaming
+// render_content_page() path is unchanged and still applies all post-processing.
+// =============================================================================
+
+struct PageStreamFilter {
+
+    httplib::DataSink& sink;
+
+    enum class Phase { PreambleHunt, BodyHunt, Streaming };
+    Phase phase = Phase::PreambleHunt;
+    std::string buf;        // accumulates content during phases 1 and 2
+
+    // Streaming highlight_false_facts state machine.
+    // The regex-based version in renderer.cpp requires the full string. Here we
+    // track state manually: buffer speculative '!' chars, emit a FONT wrapper
+    // when we confirm a closing '!!'.
+    std::string ff_pend;    // speculative chars (a lone '!' or in-fact content)
+    bool        ff_in = false; // true while inside a !!...!! span
+
+    explicit PageStreamFilter(httplib::DataSink& s) : sink(s) {}
+
+    // Called for each token piece from generate_stream().
+    // Returns false if the sink is no longer writable (client disconnected).
+    bool process(const char* piece, int plen) {
+        for (int i = 0; i < plen; i++) {
+            if (!step(piece[i])) return false;
+        }
+        return sink.is_writable();
+    }
+
+    // Called after generation completes. Flushes any buffered content and
+    // signals end-of-response to the httplib sink.
+    void flush() {
+        // Still in a buffering phase at EOS — emit whatever we have
+        if (!buf.empty()) {
+            sink.write(buf.c_str(), buf.size());
+            buf.clear();
+        }
+        // Unclosed !!...!! span — emit the raw text rather than drop it
+        if (!ff_pend.empty()) {
+            sink.write(ff_pend.c_str(), ff_pend.size());
+            ff_pend.clear();
+        }
+        sink.done();
+    }
+
+private:
+
+    // Case-insensitive: does s end with needle? (needle must already be lowercase)
+    static bool ends_ci(const std::string& s, const char* needle, size_t nlen) {
+        if (s.size() < nlen) return false;
+        size_t base = s.size() - nlen;
+        for (size_t j = 0; j < nlen; j++) {
+            if (std::tolower(static_cast<unsigned char>(s[base + j])) != needle[j])
+                return false;
+        }
+        return true;
+    }
+
+    // Case-insensitive substring search. (needle must already be lowercase)
+    static bool ci_has(const std::string& s, const char* needle, size_t nlen) {
+        if (s.size() < nlen) return false;
+        for (size_t i = 0; i <= s.size() - nlen; i++) {
+            bool ok = true;
+            for (size_t j = 0; j < nlen; j++) {
+                if (std::tolower(static_cast<unsigned char>(s[i + j])) != needle[j])
+                    { ok = false; break; }
+            }
+            if (ok) return true;
+        }
+        return false;
+    }
+
+    bool emit(const char* p, size_t n) { return n == 0 || sink.write(p, n); }
+    bool emit(const std::string& s)    { return emit(s.c_str(), s.size()); }
+    bool emit(char c)                  { return sink.write(&c, 1); }
+
+    bool step(char c) {
+        switch (phase) {
+            case Phase::PreambleHunt: return step_preamble(c);
+            case Phase::BodyHunt:     return step_body(c);
+            case Phase::Streaming:    return step_stream(c);
+        }
+        return true;
+    }
+
+    // Buffer chars and discard everything before the first <html.
+    bool step_preamble(char c) {
+        buf += c;
+        if (ends_ci(buf, "<html", 5)) {
+            // Trim any preamble text that appeared before <html
+            buf = buf.substr(buf.size() - 5);
+            phase = Phase::BodyHunt;
+        } else if (buf.size() >= 512) {
+            // Safety cap: model started without preamble, just advance
+            phase = Phase::BodyHunt;
+        }
+        return true;
+    }
+
+    // Buffer chars until the BODY opening tag's closing '>',
+    // then fix color contrast on the accumulated header and flush it.
+    bool step_body(char c) {
+        buf += c;
+        // The '>' is the signal to check — only evaluate when we might have a
+        // complete BODY tag, because the regex in fix_color_contrast needs the tag.
+        if (c == '>' && ci_has(buf, "<body", 5)) {
+            std::string fixed = fix_color_contrast(buf);
+            if (!emit(fixed)) return false;
+            buf.clear();
+            phase = Phase::Streaming;
+        } else if (buf.size() >= 4096) {
+            // Safety cap: flush and stream directly
+            if (!emit(buf)) return false;
+            buf.clear();
+            phase = Phase::Streaming;
+        }
+        return true;
+    }
+
+    // Streaming !!false fact!! → <FONT COLOR="#FF0000"><I>...</I></FONT>.
+    bool step_stream(char c) {
+        if (!ff_in) {
+            if (c == '!') {
+                ff_pend += c;
+                if (ff_pend.size() == 2) {   // confirmed opening !!
+                    ff_in = true;
+                    ff_pend.clear();
+                }
+            } else {
+                if (!ff_pend.empty()) {       // lone '!' — flush it and continue
+                    if (!emit(ff_pend)) return false;
+                    ff_pend.clear();
+                }
+                if (!emit(c)) return false;
+            }
+        } else {
+            ff_pend += c;
+            size_t n = ff_pend.size();
+            if (n >= 2 && ff_pend[n-2] == '!' && ff_pend[n-1] == '!') {
+                std::string fact = ff_pend.substr(0, n - 2);
+                std::string out  = "<FONT COLOR=\"#FF0000\"><I>" + fact + "</I></FONT>";
+                if (!emit(out)) return false;
+                ff_pend.clear();
+                ff_in = false;
+            }
+        }
+        return sink.is_writable();
+    }
+};
+
+// =============================================================================
 // Thread-safe persona picker
 //
 // std::rand() is not guaranteed to be thread-safe (the C++ standard says
@@ -288,9 +458,28 @@ int main(int argc, char* argv[]) {
         printf("[page] topic: %s  query: %s  persona: %s\n",
                topic.c_str(), query.c_str(), persona.name.c_str());
 
-        std::string raw  = gen.generate(page_system(persona), page_user(topic, query), 1500, 0.7f);
-        std::string html = render_content_page(raw);
-        res.set_content(html, "text/html");
+        // Capture prompt strings by value — they are locals that go out of scope
+        // when this route handler returns, before the content provider lambda runs
+        // on httplib's worker thread.
+        std::string sys = page_system(persona);
+        std::string usr = page_user(topic, query);
+
+        // Chunked transfer: the browser starts rendering immediately as tokens
+        // arrive rather than waiting for the full 1500-token generation to finish.
+        res.set_chunked_content_provider("text/html",
+            [&gen, sys, usr](size_t offset, httplib::DataSink& sink) mutable -> bool {
+                // httplib may call this provider more than once; only run on first call.
+                if (offset == 0) {
+                    PageStreamFilter filter(sink);
+                    gen.generate_stream(sys, usr, 1500, 0.7f,
+                        [&filter](const char* piece, int plen) -> bool {
+                            return filter.process(piece, plen);
+                        });
+                    filter.flush();
+                }
+                sink.done();
+                return true;
+            });
     });
 
     // -------------------------------------------------------------------------

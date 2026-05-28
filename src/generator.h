@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <mutex>
+#include <functional>
 
 // Forward-declare the llama.cpp types so we don't pull in the whole header here.
 // The full llama.h is only needed in generator.cpp where the implementation lives.
@@ -24,10 +25,20 @@ public:
     //   user_prompt   : the actual request (example page + topic instruction)
     //   max_tokens    : generation budget — search results need ~512, pages ~1024
     //   temperature   : 0.0 = deterministic, 1.0+ = creative/chaotic; 0.8 is a good default
+    // Blocking version — collects all tokens and returns the complete string.
     std::string generate(const std::string& system_prompt,
                          const std::string& user_prompt,
                          int max_tokens,
                          float temperature = 0.8f);
+
+    // Streaming version — calls on_token(piece, plen) for each token as it is
+    // produced. The callback returns false to abort generation early (e.g. the
+    // client disconnected). generate() is implemented as a wrapper around this.
+    void generate_stream(const std::string& system_prompt,
+                         const std::string& user_prompt,
+                         int max_tokens,
+                         float temperature,
+                         std::function<bool(const char* piece, int plen)> on_token);
 
     bool is_ok() const { return model_ != nullptr && ctx_ != nullptr; }
 
